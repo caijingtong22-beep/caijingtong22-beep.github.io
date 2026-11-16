@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>视觉预训练与 Copilot：动态分辨率、负例同步和细粒度对齐 | 蔡静桐</title><meta name="description" content="动态视觉 token、BinPack、多卡负例同步、细粒度对齐与检索后训练的工程笔记。"><link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="../../styles.css"><link rel="stylesheet" href="../blog.css"><link rel="alternate" type="text/markdown" href="visual-pretraining.md" title="Markdown 原文"></head>
+<body><a class="skip-link" href="#article">跳至正文</a><header class="topbar blog-nav"><a class="wordmark" href="../../index.html">J. Cai<span class="wordmark-dot" aria-hidden="true"></span></a><nav aria-label="文章导航"><a href="../../index.html">个人主页</a><a href="../index.html">技术博客</a></nav></header><div class="article-layout"><aside class="article-toc" aria-label="文章目录"><p>文章目录</p><a class="" href="#section-1">动态分辨率：保留细节，同时控制预算</a><a class="toc-sub" href="#section-2">区分 patch 与合并后的 token</a><a class="" href="#section-3">Window Attention 与 Window Index</a><a class="" href="#section-4">BinPack：按 token 预算组织 batch</a><a class="toc-sub" href="#section-5">离线装箱</a><a class="toc-sub" href="#section-6">在线装箱</a><a class="" href="#section-7">为什么 token 预算相同，跨卡张量仍然不同</a><a class="" href="#section-8">负例同步、DDP 与 Bidir</a><a class="" href="#section-9">动态视频帧与序列边界</a><a class="toc-sub" href="#section-10">池化与长文本</a><a class="" href="#section-11">FG-CLIP 式细粒度图文对齐</a><a class="toc-sub" href="#section-12">全局、区域与难负例</a><a class="" href="#section-13">Copilot 后训练：将反馈变成检索监督</a><a class="toc-sub" href="#section-14">Judge 数据构建</a><a class="toc-sub" href="#section-15">难负例的来源</a><a class="toc-sub" href="#section-16">三元损失与排序蒸馏</a><a class="" href="#section-17">用 Hit@5 检查候选召回</a><a class="" href="#section-18">工程复盘与后续方向</a></aside><main id="article"><article><header class="article-header"><a class="breadcrumb" href="../index.html">所有文章</a><p class="post-category" style="margin-top:20px">ViT / CLIP / Engineering</p><h1>视觉预训练与 Copilot：动态分辨率、负例同步和细粒度对齐</h1><p class="post-meta">蔡静桐 · 整理于 <time datetime="2026-11-17">2026 年 11 月 17 日</time> · 约 13 分钟</p><div class="article-actions"><a href="visual-pretraining.md" download>下载 Markdown</a><a href="visual-pretraining.md" target="_blank" rel="noopener">查看 .md 原文</a></div></header><details class="mobile-toc"><summary>文章目录</summary><a class="" href="#section-1">动态分辨率：保留细节，同时控制预算</a><a class="toc-sub" href="#section-2">区分 patch 与合并后的 token</a><a class="" href="#section-3">Window Attention 与 Window Index</a><a class="" href="#section-4">BinPack：按 token 预算组织 batch</a><a class="toc-sub" href="#section-5">离线装箱</a><a class="toc-sub" href="#section-6">在线装箱</a><a class="" href="#section-7">为什么 token 预算相同，跨卡张量仍然不同</a><a class="" href="#section-8">负例同步、DDP 与 Bidir</a><a class="" href="#section-9">动态视频帧与序列边界</a><a class="toc-sub" href="#section-10">池化与长文本</a><a class="" href="#section-11">FG-CLIP 式细粒度图文对齐</a><a class="toc-sub" href="#section-12">全局、区域与难负例</a><a class="" href="#section-13">Copilot 后训练：将反馈变成检索监督</a><a class="toc-sub" href="#section-14">Judge 数据构建</a><a class="toc-sub" href="#section-15">难负例的来源</a><a class="toc-sub" href="#section-16">三元损失与排序蒸馏</a><a class="" href="#section-17">用 Hit@5 检查候选召回</a><a class="" href="#section-18">工程复盘与后续方向</a></details><div class="article-body"><p>一个视觉编码器可以同时服务多模态大模型和图搜文检索。但从固定分辨率训练迁移到真实业务数据后，问题会逐层出现：图片细节被压缩、视觉 token 长度不一致、GPU 负载不均、跨卡样本数不同，以及全局表征难以区分局部属性。</p>
+<p>这篇文章整理这些问题之间的关系，并连接到 Copilot 后训练：如何把审核反馈变成更有价值的检索样本。原始材料包含口述记录、问答和方案讨论，以下按工程问题重组。</p>
+<h2 id="section-1">动态分辨率：保留细节，同时控制预算</h2>
+<p>固定尺寸预处理可能压缩小物体、文字或局部纹理。动态分辨率让不同图片使用不同数量的视觉 token，但仍然需要限制输入像素与 token 总量。</p>
+<p>Smart Resize 的任务是尽量保持纵横比，并把尺寸调整到模型要求的粒度，同时满足最小和最大像素预算。它仍然执行 resize，因此不应理解成“完全不缩放”或“信息无损”。</p>
+<h3 id="section-2">区分 patch 与合并后的 token</h3>
+<p>以 Qwen2.5-VL-7B 的配置为例，视觉 patch size 为 14，spatial merge size 为 2。尺寸对齐中常见的 28 来自二者的组合，而不是说最初的 patch embedding 一定使用 28×28 的卷积核。参见 <a href="https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/config.json">官方模型配置</a>。</p>
+<p>对一张高 H、宽 W 的图片，在尺寸满足对齐要求的简化情况下：</p>
+<pre><code class="language-text">ViT 内的空间 patch 数 ≈ (H / 14) × (W / 14)
+空间合并后的 token 数 ≈ (H / 28) × (W / 28)
+</code></pre>
+<p>两者服务不同计算阶段。设计 BinPack 时，必须说明预算对应的是哪一层的 token；不能将合并后的数量直接当作 ViT 内部的注意力计算量。</p>
+<h2 id="section-3">Window Attention 与 Window Index</h2>
+<p>对 N 个 token 做全局自注意力，注意力矩阵规模随 N² 增长。窗口注意力将大部分交互限制在局部区域，再通过部分全局注意力层连接不同区域。</p>
+<p>Window Index 解决的是序列组织问题。图像按行展开后，空间上属于同一窗口的 token 不一定在序列中相邻。</p>
+<pre><code class="language-text">原始 4×4 patch 网格：
+ 0   1   2   3
+ 4   5   6   7
+ 8   9  10  11
+12  13  14  15
+
+按 2×2 窗口分组：
+窗口 0：[0, 1, 4, 5]
+窗口 1：[2, 3, 6, 7]
+窗口 2：[8, 9, 12, 13]
+窗口 3：[10, 11, 14, 15]
+
+窗口顺序：
+[0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]
+</code></pre>
+<p>窗口重排使同组 token 能够交给相应的分组注意力实现。对应的位置坐标、旋转位置编码索引或相关元数据也必须同步重排，否则特征会和错误的位置配对。需要恢复原始顺序时，还应保存逆置换。</p>
+<p>图像位置包含行列信息，视频还包含时间维度。不同模块的具体编码形式应以实现为准，不能把所有位置编码都理解为直接向 token 相加一个三维向量。</p>
+<h2 id="section-4">BinPack：按 token 预算组织 batch</h2>
+<p>动态分辨率下，相同图片数不再意味着相同计算量。一个 batch 可能包含许多低分辨率图片，另一个则包含少量高分辨率图片。只按样本数分组容易造成吞吐波动与 padding 浪费。</p>
+<p>BinPack 的思路是为每个 bin 设定 token 预算，将若干完整样本放入其中，使总长度尽量接近预算。</p>
+<pre><code class="language-text">预算：4096 token
+样本长度：[1024, 512, 256, 2048, 768]
+
+bin 1：[2048, 1024, 512, 256] → 3840 token
+bin 2：[768]                  → 768 token
+</code></pre>
+<p>这是装箱示例，不是最优解保证。实际数据需要保留图像、文本和样本边界的对应关系；不同图片放入同一个 bin，也不意味着它们应当互相做注意力。</p>
+<h3 id="section-5">离线装箱</h3>
+<p>对于相对稳定的大规模开源数据，先计算长度，再在文件准备阶段装箱并封装为 tar：</p>
+<ol>
+<li>对数据做全局 shuffle，减少原始顺序带来的分布偏差。</li>
+<li>在较小的数据块内执行装箱，避免对整个大数据集一次求解。</li>
+<li>保存图文对、长度和样本边界等元数据。</li>
+<li>训练时由 DataLoader 读取已组织好的样本。</li>
+</ol>
+<p>局部装箱是在处理成本与填充率之间做取舍。原笔记把装箱和背包问题联系起来，但不应将所有装箱实现的复杂度写成统一的 O(n²)；复杂度取决于采用的启发式、排序和数据结构。</p>
+<h3 id="section-6">在线装箱</h3>
+<p>对于持续增长的业务数据，可以在 DataLoader 中按流式方式填充 bin。若单个样本长度有明确上限，顺序装箱的尾部浪费就更容易约束。</p>
+<p>原笔记用 392×224 的图像、28 的有效空间粒度举例：单样本对应 14×8＝112 个合并后 token。对于 4096 的预算，112/4096 约为 2.73%。这是特定计数口径下的上界示意，不能与 ViT 原始 patch 数混用。</p>
+<h2 id="section-7">为什么 token 预算相同，跨卡张量仍然不同</h2>
+<p>CLIP 式对比学习通常会为每张图片、每条文本输出一个 embedding。不同 GPU 即使处理了接近数量的视觉 token，包含的图片数量仍可能不同。</p>
+<pre><code class="language-text">GPU 0：3 张较大图片 → 图像特征形状 [3, d]
+GPU 1：6 张较小图片 → 图像特征形状 [6, d]
+</code></pre>
+<p>跨卡同步的是样本 embedding 时，影响接收缓冲区大小的是第一维的样本数，而不是前面的视觉 token 总预算。</p>
+<p>一种处理方式是先同步各卡样本数，再根据长度分配缓冲区，使用可变长通信或 padding 后再裁剪。图文正例索引也必须依据真实长度计算，不能继续假设每卡都有相同 batch size。</p>
+<h2 id="section-8">负例同步、DDP 与 Bidir</h2>
+<p>跨卡交换特征可以扩大当前对比学习中的候选池。例如 8 张卡各有 3 对图文，单卡只有 2 个其他文本候选；合并当前所有卡的特征后，每个图像可以和其余 23 条文本比较。</p>
+<p>要区分三件事：</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="可横向滚动的数据表"><table>
+<thead>
+<tr>
+<th>机制</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DDP 的梯度同步</td>
+<td>让各副本共同更新同一个模型</td>
+</tr>
+<tr>
+<td>All-Gather 或点对点特征交换</td>
+<td>扩大当前损失计算可见的特征集合</td>
+</tr>
+<tr>
+<td>梯度累积</td>
+<td>多个 microbatch 计算梯度后，再执行一次参数更新</td>
+</tr>
+</tbody></table></div>
+<p>**普通梯度累积不会自动扩大每次 CLIP 损失的负例池。**如果希望跨 microbatch 共享负例，需要额外的特征缓存、重计算或相应损失实现。DDP 也不会自动帮任意 CLIP 训练代码收集样本 embedding。可参考 <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html">PyTorch DDP 文档</a>。</p>
+<p>原方案使用双向通信 Bidir，让特征同时向两个方向传播，减少单向传播中的等待。实现时需要处理奇偶卡数、重复特征、通信顺序以及梯度路径。</p>
+<p><img loading="lazy" src="../assets/video-padding.png" alt="原始笔记中单向与双向通信的示意"></p>
+<p><em>图：原始笔记中的通信流程对比，具体性能取决于硬件拓扑与通信实现。</em></p>
+<p>项目记录中，负例同步带来的额外训练耗时由约 40% 降到约 10%。这里表示相对于未做负例同步基线的额外耗时，不是训练总时间减少了 30%，也不是所有硬件上都成立的加速比例。</p>
+<h2 id="section-9">动态视频帧与序列边界</h2>
+<p>固定抽取少量视频帧可能错过短暂事件；保留更多帧又会增加计算开销。原方案讨论根据帧数和 token 总预算组织可变长视频，而不是把所有视频补到同一长度。</p>
+<p>在这种设计中，需要区分三个层级：</p>
+<ul>
+<li>帧内局部与全局交互，用于处理空间细节。</li>
+<li>同一视频内的跨帧交互，用于处理时间关联。</li>
+<li>不同视频之间的边界，避免互不相关的样本相互注意。</li>
+</ul>
+<p>使用变长注意力实现时，可通过累计序列长度 <code>cu_seqlens</code> 指定独立序列的边界。例如长度 <code>[26, 40, 18]</code> 对应累计边界 <code>[0, 26, 66, 84]</code>。在帧内计算和视频内计算阶段，应分别使用与该层级一致的边界。</p>
+<p>这里是原笔记讨论的扩展方案，不应直接当作所有 Qwen2.5-VL 实现的默认视频结构。动态帧数也不意味着可以无预算地输入每一帧。</p>
+<h3 id="section-10">池化与长文本</h3>
+<p>图像或视频编码后，可通过平均池化得到固定维度的 embedding。注意力池化是另一种选择，但需要单独验证计算成本与效果。池化时应排除 padding，区分按帧平均和按全部 token 平均。</p>
+<p>原笔记还使用 BERT / BGE 文本编码器，并针对所用配置的 512 token 限制进行分段编码，再聚合各段表征。这个限制属于具体模型配置，不能推广到所有 BGE 模型。分段时还需要预留特殊 token 的空间。</p>
+<h2 id="section-11">FG-CLIP 式细粒度图文对齐</h2>
+<p>全局图文相似度可能无法充分区分局部属性：图片里是白猫还是黑猫、某一区域是纹身还是伤痕，都会影响细粒度判断。</p>
+<p>原方案参考 FG-CLIP v1，把训练目标分为全局对齐、区域对齐和难负例区分。参见 <a href="https://github.com/360CVGroup/FG-CLIP">FG-CLIP 项目</a>。</p>
+<h3 id="section-12">全局、区域与难负例</h3>
+<p>全局目标比较整图与描述；区域目标比较局部图像与对应短语；难负例目标让模型区分语义接近但属性或动作不符的描述。</p>
+<p>数据准备流程包括：</p>
+<ol>
+<li>为图像补充完整 Caption，避免只有一个过短的审核标签。</li>
+<li>从 Caption 提取实体或短语，并用目标检测器获得候选区域。</li>
+<li>用已有对齐模型计算区域与短语的相似度，自举生成局部图文对。</li>
+<li>保留主要对象，修改颜色、属性或动作，生成候选难负例。</li>
+<li>质量检查，防止把实际也正确的描述误当作负例。</li>
+</ol>
+<p>检测框筛选中，置信度阈值和非极大值抑制是不同步骤：前者过滤低分候选，后者根据重叠关系抑制重复框，不能只用一个分数阈值概括 NMS。</p>
+<p>自举使用已有模型生成下一轮训练数据；教师蒸馏则使用教师的输出作为监督。二者可以结合，但仅仅把图像向量和文本向量求相似度，并不自动意味着完成了蒸馏。</p>
+<h2 id="section-13">Copilot 后训练：将反馈变成检索监督</h2>
+<p>在 Copilot 中，图像向量用于检索拒绝理由。原笔记使用 FAISS 进行向量索引与相似度搜索，审核员核对 Top-K 候选；若候选中缺少正确理由，则补充答案。</p>
+<p>人工确认的理由可以成为正样本，被召回但不适用的理由则可能成为难负例。这样积累的监督更贴近检索模型容易出错的边界。</p>
+<p><img loading="lazy" src="../assets/copilot-training.png" alt="Copilot 数据构建、Judge 与后训练流程"></p>
+<p><em>图：原始笔记中的 Copilot 后训练流程。</em></p>
+<h3 id="section-14">Judge 数据构建</h3>
+<p>先用 Qwen2.5-VL 生成候选图像—理由对，再由 Judge 判断相关性。原方案同时使用明确的规则、few-shot、典型错误样本、低温生成和模型投票改善标注，并以 2,000 余条人工标注数据进行 LoRA 微调。</p>
+<p>笔记把与人工判断约 95% 一致作为目标；在缺少独立评估记录时，不把它写成已经测得的结果。Judge 的新旧版本分歧可以用来挖掘待检查样本，但不能仅凭新版本的判断就断言旧版本一定错误。</p>
+<h3 id="section-15">难负例的来源</h3>
+<ul>
+<li>审核员确认错误的高相似候选。</li>
+<li>Judge 版本之间的判断分歧，经进一步确认后使用。</li>
+<li>KNN 召回中相似但不正确的理由。</li>
+<li>与已确认难负例语义接近、且同样不适用的理由。</li>
+</ul>
+<p>后两种扩展尤其需要过滤潜在正例；相似文本不天然就是负例。</p>
+<h3 id="section-16">三元损失与排序蒸馏</h3>
+<p>使用距离定义三元损失时，可写为：</p>
+<pre><code class="language-text">L_triplet = max(0, d(image, positive) - d(image, negative) + margin)
+</code></pre>
+<p>目标是让正例距离至少比负例距离小一个 margin。它约束的是相对关系，不保证未见样本的排序，也不必然校准全部相似度。</p>
+<p>原笔记进一步讨论使用教师重排序分数，通过 MSE 等目标监督学生模型。这里必须澄清输入接口：**BGE-reranker-v2-m3 是文本对重排序模型，不能直接输入原始图像。**若采用它作为教师，需要说明图片经过了怎样的文本化表示；若直接评价图像与理由，则应采用支持相应输入的教师。原稿未完整记录这一适配环节，因此不能把某种具体输入方案写成已经实现。参见 <a href="https://huggingface.co/BAAI/bge-reranker-v2-m3">BGE-reranker-v2-m3 模型说明</a>。</p>
+<h2 id="section-17">用 Hit@5 检查候选召回</h2>
+<p>Hit@5 统计前五个候选中至少包含一个正确理由的查询比例：</p>
+<pre><code class="language-text">Hit@5 = 前 5 个候选中命中正确理由的查询数 / 总查询数
+</code></pre>
+<p>例如 100 次查询中有 97 次命中，Hit@5 为 97%。这是指标解释示例，不是项目已测得的成绩。</p>
+<p>如果一张图片有多个正确理由，Hit@K 与 Recall@K 就不是同一指标：前者关注是否至少命中一个，后者关注相关理由被召回的比例。最终系统还需评估后续判断质量与候选缺失时的处理方式。</p>
+<h2 id="section-18">工程复盘与后续方向</h2>
+<p>动态分辨率改变了长度分布，长度分布推动了装箱策略，装箱又改变每卡样本数，从而影响负例同步。细粒度对齐和 Copilot 后训练，则将优化重点从全局相似转向容易混淆的局部与业务语义。</p>
+<p>原笔记中增加 Caption decoder、自监督目标等内容属于后续方向，不能列为已完成成果。继续扩展时，最有价值的是保留可对照的实验版本：分别测量吞吐、显存、候选召回和最终判断质量，避免只凭单个指标判断整条链路。</p>
+<hr>
+<p>本文根据《风控大模型》整理，合并了重复口述与问答，保留主要工程主题。对 patch/token 粒度、梯度累积、DDP、NMS、重排序模型输入和指标口径补充了必要澄清；规划与示例不作为实测成果。</p>
+</div><nav class="post-pagination" aria-label="相关文章"><div><span>上一篇</span><a href="risk-model-training.html">风控多模态大模型：领域知识、渐进式训练与检索协同</a></div></nav></article></main></div><footer class="blog-footer"><span>© 2026 Jingtong Cai</span><a href="../index.html">返回技术博客</a></footer></body></html>
